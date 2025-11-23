@@ -1,153 +1,274 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python
 # -*- coding: utf-8 -*-
+
+"""
+2025/11/23
+"""
 
 import json
 import os
 import re
-import sys
-from typing import Tuple
+from pathlib import Path
+from typing import Any, Dict, Optional, Tuple
 
-from github import Github
-
-from lyrics_core import (
-    search_lyrics_candidates,
-    register_lyrics_from_request,
-    format_lyrics_for_issue_body,
-)
+from github import Github, Auth
+from yt_dlp import YoutubeDL
+from yt_dlp.utils import DownloadError
 
 
-def load_event() -> dict:
-    """GitHub Actions から渡される event payload を読む"""
-    path = os.environ.get("GITHUB_EVENT_PATH")
-    if not path or not os.path.exists(path):
-        print("GITHUB_EVENT_PATH が見つかりません", file=sys.stderr)
-        sys.exit(1)
+ROOT_DIR = Path(__file__).resolve().parent.parent
+WORKDIR = ROOT_DIR  # 一応ワークディレクトリ
 
-    with open(path, encoding="utf-8") as f:
+# デフォルトの cookies.txt のパス（ワークフローステップで書き出した想定）
+DEFAULT_COOKIES_PATH = ROOT_DIR / "youtube_cookies.txt"
+
+
+# ---------- GitHub イベント関連 ----------
+
+
+def load_github_event() -> Dict[str, Any]:
+    """
+    Actions から渡される GITHUB_EVENT_PATH から event JSON を読み込む。
+    """
+    event_path = os.environ.get("GITHUB_EVENT_PATH")
+    if not event_path:
+        raise RuntimeError("環境変数 GITHUB_EVENT_PATH が設定されていません。")
+
+    with open(event_path, "r", encoding="utf-8") as f:
         return json.load(f)
 
 
-def _search_first(text: str, patterns) -> str | None:
-    for p in patterns:
-        m = re.search(p, text, flags=re.MULTILINE)
+# ---------- Issue 本文パース ----------
+
+
+ISSUE_ARTIST_PATTERNS = [
+    r"^アーティスト(?:名)?\s*[:：]\s*(.+)$",
+    r"^Artist\s*[:：]\s*(.+)$",
+]
+ISSUE_TITLE_PATTERNS = [
+    r"^楽曲名\s*[:：]\s*(.+)$",
+    r"^タイトル\s*[:：]\s*(.+)$",
+    r"^Title\s*[:：]\s*(.+)$",
+]
+ISSUE_VIDEO_ID_PATTERNS = [
+    r"^動画\s*ID\s*[:：]\s*([0-9A-Za-z_-]{8,})$",
+    r"(?:youtube\.com/watch\?v=|youtu\.be/)([0-9A-Za-z_-]{8,})",
+]
+
+
+def _search_one(patterns, text: str) -> Optional[str]:
+    for pat in patterns:
+        m = re.search(pat, text, flags=re.MULTILINE)
         if m:
-            return m.group(1).strip()
+            value = m.group(1).strip()
+            if value:
+                return value
     return None
 
 
-def parse_issue_fields(title: str, body: str) -> Tuple[str, str, str]:
+def parse_issue_body(body: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
     """
-    Issue のタイトル＋本文から
+    Issue テンプレから
     - アーティスト
-    - タイトル
-    - 動画 ID
+    - 楽曲名
+    - 動画 ID（または URL から抽出）
     を抜き出す。
-    想定テンプレート:
-
-      アーティスト: xxx
-      タイトル: yyy
-      動画 ID: by4SYYWlhEs
-
-    ※「Artist:」「Title:」「Video ID:」でも OK
     """
-    text = f"{title}\n{body}"
+    artist = _search_one(ISSUE_ARTIST_PATTERNS, body)
+    title = _search_one(ISSUE_TITLE_PATTERNS, body)
+    video_id = _search_one(ISSUE_VIDEO_ID_PATTERNS, body)
 
-    artist = _search_first(
-        text,
-        [
-            r"^アーティスト\s*[:：]\s*(.+)$",
-            r"^Artist\s*[:：]\s*(.+)$",
-        ],
+    return artist, title, video_id
+
+
+# ---------- YouTube 検索 ----------
+
+
+def search_youtube_by_artist_title(
+    artist: str,
+    title: str,
+    cookies_path: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """
+    アーティスト + 曲名 から yt-dlp を使って YouTube を検索。
+    先頭の 1 件を返す。
+    """
+    query = f"{artist} {title}"
+
+    ydl_opts: Dict[str, Any] = {
+        "quiet": True,
+        "skip_download": True,
+        "default_search": "ytsearch1",  # 1件だけ検索
+    }
+
+    if cookies_path and cookies_path.is_file():
+        # --cookies <file> 相当
+        ydl_opts["cookiefile"] = str(cookies_path)
+
+    try:
+        with YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(query, download=False)
+    except DownloadError as e:
+        raise RuntimeError(f"YouTube 検索に失敗しました: {e}") from e
+
+    # ytsearch の場合は entries の中に入っている
+    if "entries" in info and isinstance(info["entries"], list) and info["entries"]:
+        info = info["entries"][0]
+
+    return info
+
+
+def ensure_cookies_path() -> Optional[Path]:
+    """
+    クッキーファイルのパスを決定する。
+
+    - まず環境変数 YT_COOKIES_FILE を見る
+    - なければデフォルトの youtube_cookies.txt（ワークフローで書き出した想定）
+    - それでもなければ None
+    """
+    env_path = os.environ.get("YT_COOKIES_FILE")
+    if env_path:
+        p = Path(env_path)
+        if p.is_file():
+            return p
+
+    if DEFAULT_COOKIES_PATH.is_file():
+        return DEFAULT_COOKIES_PATH
+
+    return None
+
+
+# ---------- GitHub への反映 ----------
+
+
+def build_comment_body(
+    artist: Optional[str],
+    title: Optional[str],
+    video_id: Optional[str],
+    info: Optional[Dict[str, Any]],
+) -> str:
+    """
+    Issue に書き込むコメント本文を作る。
+    """
+    lines = []
+    lines.append("自動処理結果をお知らせします :robot:\n")
+
+    lines.append("### 解析結果")
+    if artist:
+        lines.append(f"- アーティスト: **{artist}**")
+    else:
+        lines.append("- アーティスト: (未入力)")
+    if title:
+        lines.append(f"- 楽曲名: **{title}**")
+    else:
+        lines.append("- 楽曲名: (未入力)")
+
+    if video_id:
+        lines.append(f"- 動画 ID: `{video_id}`")
+
+    if info:
+        vid = info.get("id") or video_id
+        url = info.get("webpage_url") or (
+            f"https://www.youtube.com/watch?v={vid}" if vid else None
+        )
+        yt_title = info.get("title")
+        duration = info.get("duration")
+        lines.append("\n### YouTube 検索結果")
+        if yt_title:
+            lines.append(f"- 動画タイトル: **{yt_title}**")
+        if url:
+            lines.append(f"- URL: {url}")
+        if duration:
+            lines.append(f"- 再生時間: {duration} 秒")
+
+    lines.append("\n---")
+    lines.append(
+        "※ このコメントは GitHub Actions の自動処理で追加されています。"
     )
 
-    song_title = _search_first(
-        text,
-        [
-            r"^タイトル\s*[:：]\s*(.+)$",
-            r"^曲名\s*[:：]\s*(.+)$",
-            r"^Title\s*[:：]\s*(.+)$",
-        ],
-    )
-
-    # 動画 ID or URL から ID を取る
-    video_id = _search_first(
-        text,
-        [
-            r"^(?:動画ID|動画 ID)\s*[:：]\s*([0-9A-Za-z_-]{6,})$",
-            r"^Video ID\s*[:：]\s*([0-9A-Za-z_-]{6,})$",
-            r"\b(?:https?://)?(?:www\.)?youtu(?:\.be/|be\.com/watch\?v=)([0-9A-Za-z_-]{6,})",
-        ],
-    )
-
-    missing = []
-    if not artist:
-        missing.append("アーティスト")
-    if not song_title:
-        missing.append("タイトル")
-    if not video_id:
-        missing.append("動画 ID / Video ID")
-
-    if missing:
-        raise ValueError("必須項目が読み取れませんでした: " + ", ".join(missing))
-
-    return artist, song_title, video_id
+    return "\n".join(lines)
 
 
-def _get_github():
-    token = os.environ.get("GH_PAT") or os.environ.get("GITHUB_TOKEN")
-    if not token:
-        print("GH_PAT または GITHUB_TOKEN が設定されていません", file=sys.stderr)
-        sys.exit(1)
-    return Github(token)
+def comment_to_issue(
+    repo,
+    issue_number: int,
+    body: str,
+) -> None:
+    issue = repo.get_issue(number=issue_number)
+    issue.create_comment(body)
+
+
+# ---------- メイン処理 ----------
 
 
 def main() -> None:
-    event = load_event()
-    issue = event.get("issue") or {}
-    issue_number = issue.get("number")
-    issue_title = issue.get("title") or ""
-    issue_body = issue.get("body") or ""
+    # GitHub 認証
+    token = os.environ.get("GITHUB_TOKEN")
     repo_name = os.environ.get("GITHUB_REPOSITORY")
 
-    if not issue_number or not repo_name:
-        print("GITHUB_REPOSITORY または issue 番号が取得できませんでした", file=sys.stderr)
-        sys.exit(1)
+    if not token:
+        raise RuntimeError("環境変数 GITHUB_TOKEN が設定されていません。")
+    if not repo_name:
+        raise RuntimeError("環境変数 GITHUB_REPOSITORY が設定されていません。")
 
-    gh = _get_github()
+    gh = Github(auth=Auth.Token(token))
     repo = gh.get_repo(repo_name)
-    issue_obj = repo.get_issue(number=issue_number)
 
-    # 1. Issue から必要情報をパース
-    try:
-        artist, title, video_id = parse_issue_fields(issue_title, issue_body)
-    except Exception as e:
-        issue_obj.create_comment(f"入力の解析に失敗しました。\n\n```\n{e}\n```")
-        raise
+    event = load_github_event()
+    action = event.get("action")
+    issue_data = event.get("issue")
 
-    # 2. YouTube 自動字幕から歌詞を取得
-    try:
-        lyrics, vid, info = register_lyrics_from_request(artist, title, video_id)
-    except Exception as e:
-        issue_obj.create_comment(f"歌詞の取得に失敗しました。\n\n```\n{e}\n```")
-        raise
+    # issue イベントでなければスキップ
+    if not issue_data:
+        print("issue イベントではないため何もしません。")
+        return
 
-    video_url = ""
-    if isinstance(info, dict):
-        video_url = info.get("url", "")
-    if not video_url:
-        video_url = f"https://www.youtube.com/watch?v={vid}"
+    issue_number = issue_data["number"]
+    issue_body = issue_data.get("body") or ""
 
-    # 3. コメント本文を整形
-    comment_body = format_lyrics_for_issue_body(artist, title, lyrics, video_url)
+    print(f"action={action}, issue_number={issue_number}")
 
-    # 4. Issue にコメント
-    issue_obj.create_comment(comment_body)
+    # opened / edited の時だけ処理する
+    if action not in {"opened", "edited"}:
+        print("opened/edited 以外のアクションなのでスキップします。")
+        return
 
-    # 5. 任意: ラベルを付ける（無ければ無視）
-    try:
-        issue_obj.add_to_labels("lyrics-added")
-    except Exception:
-        pass
+    # Issue 本文を解析
+    artist, title, video_id = parse_issue_body(issue_body)
+    print(f"parsed: artist={artist}, title={title}, video_id={video_id}")
+
+    cookies_path = ensure_cookies_path()
+    if cookies_path:
+        print(f"Using cookies file: {cookies_path}")
+    else:
+        print("cookies ファイルが見つからなかったので未ログイン状態で実行します。")
+
+    info: Optional[Dict[str, Any]] = None
+
+    # アーティストと曲名がそろっている場合にだけ YouTube 検索
+    if artist and title:
+        try:
+            info = search_youtube_by_artist_title(
+                artist=artist,
+                title=title,
+                cookies_path=cookies_path,
+            )
+            if not video_id:
+                video_id = info.get("id")
+        except RuntimeError as e:
+            # 検索エラーはそのままコメントに書く
+            err_body = (
+                f"自動処理で YouTube 検索を試みましたが失敗しました。\n\n"
+                f"```\n{e}\n```\n"
+            )
+            comment_to_issue(repo, issue_number, err_body)
+            raise
+
+    # 結果をコメントとして Issue に投稿
+    comment_body = build_comment_body(artist, title, video_id, info)
+    comment_to_issue(repo, issue_number, comment_body)
+
+    print("処理が完了しました。")
 
 
 if __name__ == "__main__":
