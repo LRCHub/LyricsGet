@@ -2,11 +2,22 @@
 # LyricsAddRequest の Issue を受けて歌詞を登録する GitHub Actions 用スクリプト
 
 from __future__ import annotations
+
 import os
+import sys
+from pathlib import Path
 from typing import Tuple
 
 from github import Github
 import yt_dlp
+
+# ─────────────────────────────────────────
+# リポジトリルートを import パスに追加（重要）
+# ─────────────────────────────────────────
+
+ROOT = Path(__file__).resolve().parents[1]  # .../LyricsAddRequest
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from lyrics_core import (
     github_get_lyrics,
@@ -75,7 +86,7 @@ def fetch_lyrics_for_info(info: dict) -> Tuple[object, object, object]:
     yt_full_title = info.get("title") or display or ""
     track_name = meta.get("track") or song_only(yt_full_title)
 
-    # 1) LrcLib
+    # 1) LrcLib（曲名オンリー）
     rec = lrclib_search(track_name) if track_name else None
     if rec:
         plain, cues = lrclib_to_lyrics(rec)
@@ -157,7 +168,12 @@ def register_lyrics_from_request(artist: str, title: str):
 # ─────────────────────────────────────────
 
 def main():
-    # PAT（Issue にコメントする用。歌詞保存用は lyrics_core 側も同じ環境変数を見ている）
+    """
+    必要な環境変数:
+      - GITHUB_REPOSITORY   … "neiron-discord/LyricsAddRequest"
+      - ISSUE_NUMBER        … トリガーになった Issue 番号
+      - LYRICS_GH_TOKEN or GITHUB_TOKEN … 歌詞保存 & コメント用 PAT
+    """
     token = os.environ.get("LYRICS_GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
     if not token:
         raise RuntimeError("LYRICS_GH_TOKEN または GITHUB_TOKEN が設定されていません")
@@ -175,7 +191,10 @@ def main():
     if len(lines) < 2:
         issue.create_comment(
             "フォーマットは以下の2行で入力してください：\n"
-            "```text\nアーティスト名\n曲名\n```"
+            "```text\n"
+            "アーティスト名\n"
+            "曲名\n"
+            "```"
         )
         issue.edit(state="closed")
         return
@@ -191,6 +210,8 @@ def main():
             f"{e}\n"
             "```"
         )
+        # 失敗時は Issue を開けたままでもいいが、とりあえず閉じるならここで:
+        # issue.edit(state="closed")
         raise
 
     user = gh.get_user()
