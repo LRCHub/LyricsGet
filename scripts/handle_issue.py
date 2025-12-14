@@ -273,7 +273,7 @@ def build_comment_body(
     lines.append("```")
     lines.append(JSON_END)
 
-    lines.append("\n※ このコメントは GitHub Actions の自動処理で追加されています。")
+    lines.append("\n※ このコメントは自動的に処理されています。間違った情報を返す場合があります。アーティストと曲名は、テンプレートに沿い、完全一致でお願いいたします")
     return "\n".join(lines)
 
 
