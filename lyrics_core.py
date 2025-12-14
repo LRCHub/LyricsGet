@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+import glob
 import os
 import tempfile
 from typing import Any, Dict, List, Tuple
@@ -13,11 +14,13 @@ def _cookie_file() -> str | None:
     YT の cookie ファイルのパスを推測する。
     優先順位:
       1. 環境変数 YT_COOKIES_FILE
-      2. リポジトリルートの youtube_cookies.txt
+      2. 環境変数 YOUTUBE_COOKIES_FILE（過去互換）
+      3. リポジトリルートの youtube_cookies.txt
     """
-    path = os.environ.get("YT_COOKIES_FILE")
-    if path and os.path.exists(path):
-        return path
+    for key in ("YT_COOKIES_FILE", "YOUTUBE_COOKIES_FILE"):
+        path = os.environ.get(key)
+        if path and os.path.exists(path):
+            return path
 
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     path2 = os.path.join(repo_root, "youtube_cookies.txt")
@@ -45,30 +48,39 @@ def _base_ydl_opts() -> Dict[str, Any]:
 def _download_auto_sub_srt(video_id: str) -> str:
     """
     yt-dlp を使って自動生成字幕を SRT 形式で一時ディレクトリに保存し、そのパスを返す。
+    ※ yt-dlp は「<id>.<lang>.srt」などで吐くことがあるので glob で拾う。
     """
     url = f"https://www.youtube.com/watch?v={video_id}"
-    tmp_dir = tempfile.gettempdir()
-    out_path = os.path.join(tmp_dir, f"{video_id}.srt")
 
-    ydl_opts = _base_ydl_opts()
-    # SRT で自動生成字幕だけを保存
-    ydl_opts.update(
-        {
-            "writeautomaticsub": True,
-            "subtitlesformat": "srt",
-            "skip_download": True,
-            "outtmpl": out_path,
-        }
-    )
+    with tempfile.TemporaryDirectory(prefix="yt_sub_") as tmp_dir:
+        # outtmpl は拡張子や言語が付くことがあるので「ベース名」だけ指定
+        outtmpl = os.path.join(tmp_dir, "%(id)s")
 
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        # list で渡す必要がある
-        ydl.download([url])
+        ydl_opts = _base_ydl_opts()
+        ydl_opts.update(
+            {
+                "writeautomaticsub": True,
+                "subtitlesformat": "srt",
+                "skip_download": True,
+                "outtmpl": outtmpl,
+            }
+        )
 
-    if not os.path.exists(out_path):
-        raise RuntimeError(f"SRT 字幕ファイルが生成されませんでした: {out_path}")
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
 
-    return out_path
+        # 生成された srt を拾う（複数言語が出たら一番大きいものを採用）
+        candidates = glob.glob(os.path.join(tmp_dir, "*.srt"))
+        if not candidates:
+            raise RuntimeError("SRT 字幕ファイルが生成されませんでした。")
+
+        best = max(candidates, key=lambda p: os.path.getsize(p))
+        # tmp_dir が消える前に内容を別ファイルへコピーして返す
+        final_path = os.path.join(tempfile.gettempdir(), f"{video_id}.auto.srt")
+        with open(best, "rb") as src, open(final_path, "wb") as dst:
+            dst.write(src.read())
+
+        return final_path
 
 
 def _srt_to_lyrics(path: str) -> str:
@@ -76,20 +88,17 @@ def _srt_to_lyrics(path: str) -> str:
     SRT ファイルから歌詞テキストだけを抜き出す (タイムスタンプと番号行は削除)。
     """
     lines: List[str] = []
-    with open(path, encoding="utf-8") as f:
+    with open(path, encoding="utf-8", errors="replace") as f:
         for raw in f:
             line = raw.strip()
             if not line:
                 continue
             if line.isdigit():
-                # インデックス番号
                 continue
             if "-->" in line:
-                # タイムスタンプ行
                 continue
             lines.append(line)
 
-    # 同じ行が連続していることがあるので軽く除去
     merged: List[str] = []
     last: str | None = None
     for line in lines:
@@ -103,9 +112,7 @@ def _srt_to_lyrics(path: str) -> str:
 
 def search_lyrics_candidates(*args, **kwargs) -> List[Dict[str, Any]]:
     """
-    互換性用のダミー実装。
-    もし別サイトから歌詞候補を検索したくなったら、ここに実装を追加する。
-    今は常に空リストを返す。
+    互換性用のダミー実装（現状未使用）
     """
     return []
 
