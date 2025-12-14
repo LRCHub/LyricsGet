@@ -10,6 +10,7 @@ jobs:
 
     env:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      YOUTUBE_COOKIES: ${{ secrets.YOUTUBE_COOKIES }}
 
     steps:
       - name: Checkout
@@ -23,10 +24,17 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install PyGithub requests rapidfuzz
+          python -m pip install yt-dlp PyGithub requests beautifulsoup4 rapidfuzz pillow
+
+      - name: Write YouTube cookies file
+        run: |
+          printf '%s\n' "$YOUTUBE_COOKIES" > youtube_cookies.txt
 
       - name: Handle issue
         env:
+          # ★ 修正：lyrics_core.py が見る env 名（両対応も入れるが、ここは正しい名前に）
+          YT_COOKIES_FILE: youtube_cookies.txt
+
           GITHUB_TOKEN: ${{ env.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           ISSUE_NUMBER: ${{ github.event.issue.number }}
