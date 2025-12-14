@@ -4,14 +4,17 @@
 import json
 import os
 import re
+import sys
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 import requests
 from github import Github, Auth
 
-
 ROOT_DIR = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT_DIR))  # ルートの lyrics_core.py を import できるようにする
+
+import lyrics_core  # noqa: E402
 
 
 # ---------- GitHub イベント読み込み ----------
@@ -27,20 +30,17 @@ def load_github_event() -> Dict[str, Any]:
 # ---------- Issue 本文パース（パターンA） ----------
 
 YOUTUBE_PATTERNS = [
-    # https://youtu.be/<id>
     r"(?:https?://)?(?:www\.)?youtu\.be/([0-9A-Za-z_-]{8,})",
-    # https://www.youtube.com/watch?v=<id>
     r"(?:https?://)?(?:www\.)?youtube\.com/watch\?v=([0-9A-Za-z_-]{8,})",
-    # https://www.youtube.com/shorts/<id>
     r"(?:https?://)?(?:www\.)?youtube\.com/shorts/([0-9A-Za-z_-]{8,})",
 ]
 
 
 def extract_video_id_from_text(text: str) -> Optional[str]:
     for pat in YOUTUBE_PATTERNS:
-        m = re.search(pat, text)
+        m = re.search(pat, text or "")
         if m:
-            vid = m.group(1).strip()
+            vid = (m.group(1) or "").strip()
             if vid:
                 return vid
     return None
@@ -56,11 +56,9 @@ def parse_issue_body(body: str) -> Tuple[Optional[str], Optional[str], Optional[
     """
     artist: Optional[str] = None
     title: Optional[str] = None
-    video_id: Optional[str] = None
 
     lines = [line.strip() for line in (body or "").splitlines()]
 
-    # 1行目から「アーティスト - タイトル」を取得
     for line in lines:
         if not line:
             continue
@@ -70,15 +68,13 @@ def parse_issue_body(body: str) -> Tuple[Optional[str], Optional[str], Optional[
             title = (right or "").strip() or None
             break
 
-    # 本文全体から YouTube 動画IDを取得
     video_id = extract_video_id_from_text(body or "")
-
     return artist, title, video_id
 
 
-# ---------- 歌詞 API (名前は出さない) ----------
+# ---------- LRCLIB ----------
 
-LRC_LIB_BASE = "https://lrclib.net"   # コード内だけで使用。コメントには書かない。
+LRC_LIB_BASE = "https://lrclib.net"
 
 
 def _nf_lrc(s: str) -> str:
@@ -87,13 +83,12 @@ def _nf_lrc(s: str) -> str:
     return re.sub(r"\s+", " ", t).strip().lower()
 
 
-def search_lyrics_by_artist_title(
+def search_lrclib_by_artist_title(
     artist: Optional[str],
     title: Optional[str],
 ) -> Optional[Dict[str, Any]]:
     """
-    外部歌詞API /api/search を叩いて最も良さそうな1件を返す。
-    コメントにサービス名は出さない。
+    LRCLIB /api/search を叩いて最も良さそうな1件を返す。
     """
     if not artist and not title:
         return None
@@ -104,7 +99,6 @@ def search_lyrics_by_artist_title(
     if artist:
         params["artist_name"] = artist
 
-    # どちらかは必須
     if not params:
         return None
 
@@ -113,26 +107,21 @@ def search_lyrics_by_artist_title(
         r.raise_for_status()
         data = r.json()
     except Exception as e:
-        print(f"[lyrics] search error: {e}")
+        print(f"[lrclib] search error: {e}")
         return None
 
     if not isinstance(data, list) or not data:
         return None
 
-    # track_name / artist_name がある場合は簡易スコア
     def score(rec: Dict[str, Any]) -> int:
         s = 0
         if title and rec.get("trackName"):
-            s += 2 * (100 - abs(len(_nf_lrc(title)) - len(_nf_lrc(rec["trackName"]))))
+            s += 2 * (100 - abs(len(_nf_lrc(title)) - len(_nf_lrc(str(rec["trackName"])))))
         if artist and rec.get("artistName"):
-            s += 2 * (100 - abs(len(_nf_lrc(artist)) - len(_nf_lrc(rec["artistName"]))))
+            s += 2 * (100 - abs(len(_nf_lrc(artist)) - len(_nf_lrc(str(rec["artistName"])))))
         return s
 
-    if artist or title:
-        best = max(data, key=score)
-        return best
-
-    return data[0]
+    return max(data, key=score)
 
 
 # ---------- コメント生成 ----------
@@ -141,11 +130,27 @@ JSON_START = "<!-- LYRICS_API_JSON_START -->"
 JSON_END = "<!-- LYRICS_API_JSON_END -->"
 
 
+def _looks_like_lyrics(text: str) -> bool:
+    t = (text or "").strip()
+    if not t:
+        return False
+    # 2行以上、かつ少しは長いものだけを「成功」とみなす（短すぎる誤爆を回避）
+    lines = [x.strip() for x in t.splitlines() if x.strip()]
+    if len(lines) < 2:
+        return False
+    if len(t) < 20:
+        return False
+    return True
+
+
 def build_comment_body(
     artist: Optional[str],
     title: Optional[str],
     video_id: Optional[str],
-    rec: Optional[Dict[str, Any]],
+    chosen_source: str,  # "youtube" | "lrclib" | "none"
+    youtube_lyrics: Optional[str],
+    youtube_info: Optional[Dict[str, Any]],
+    lrclib_rec: Optional[Dict[str, Any]],
 ) -> str:
     lines: list[str] = []
 
@@ -155,32 +160,36 @@ def build_comment_body(
     lines.append("### 解析結果")
     lines.append(f"- アーティスト: **{artist}**" if artist else "- アーティスト: (未入力)")
     lines.append(f"- 楽曲名: **{title}**" if title else "- 楽曲名: (未入力)")
-    if video_id:
-        lines.append(f"- 動画 ID: `{video_id}`")
-    else:
-        lines.append("- 動画 ID: (未指定)")
+    lines.append(f"- 動画 ID: `{video_id}`" if video_id else "- 動画 ID: (未指定)")
 
-    # 歌詞結果
     lines.append("\n### 歌詞登録結果")
 
-    if rec is None:
-        lines.append("- ステータス: 歌詞の取得に失敗しました")
-        lines.append("- 取得元: 外部歌詞データベース（取得エラー）")
-    else:
-        plain = (rec.get("plainLyrics") or "").strip()
-        synced = (rec.get("syncedLyrics") or "").strip()
+    if chosen_source == "youtube" and youtube_lyrics:
+        lines.append("- ステータス: Auto（YouTube 自動字幕）")
+        lines.append("- 取得元: YouTube（自動字幕）")
+        if youtube_info and youtube_info.get("url"):
+            lines.append(f"- 参照: {youtube_info['url']}")
+        lines.append("\n#### 歌詞（テキスト）")
+        lines.append("```text")
+        lines.append(youtube_lyrics.strip())
+        lines.append("```")
+
+    elif chosen_source == "lrclib" and lrclib_rec:
+        plain = (lrclib_rec.get("plainLyrics") or "").strip()
+        synced = (lrclib_rec.get("syncedLyrics") or "").strip()
 
         if synced:
-            status = "Auto/同期あり"
+            status = "Auto（同期あり）"
         elif plain:
-            status = "Auto/同期なし"
+            status = "Auto（同期なし）"
         else:
             status = "歌詞の登録なし"
 
         lines.append(f"- ステータス: {status}")
-        lines.append("- 取得元: 外部歌詞データベース")
-        tn = (rec.get("trackName") or rec.get("name") or "").strip()
-        an = (rec.get("artistName") or "").strip()
+        lines.append("- 取得元: LRCLIB")
+
+        tn = (lrclib_rec.get("trackName") or lrclib_rec.get("name") or "").strip()
+        an = (lrclib_rec.get("artistName") or "").strip()
         detail = []
         if tn:
             detail.append(f"track='{tn}'")
@@ -189,7 +198,6 @@ def build_comment_body(
         if detail:
             lines.append(f"- 取得詳細: {', '.join(detail)}")
 
-        # 人間向けに歌詞本体も（長くなる場合あり）
         if synced:
             lines.append("\n#### syncedLyrics（タイミング付き）")
             lines.append("```lrc")
@@ -202,12 +210,26 @@ def build_comment_body(
             lines.append(plain)
             lines.append("```")
 
-    # ローカルPC用：機械が読み取る JSON ペイロード
+        if (not synced) and (not plain):
+            lines.append("- 歌詞が空でした。")
+
+    else:
+        lines.append("- ステータス: 歌詞の取得に失敗しました")
+        lines.append("- 取得元: YouTube → LRCLIB（どちらも失敗）")
+
+    # 機械用ペイロード
     payload: Dict[str, Any] = {
         "videoId": video_id,
         "artist": artist,
         "title": title,
-        "sourceRecord": rec,  # None でもそのまま
+        "chosenSource": chosen_source,
+        "youtube": {
+            "lyrics": youtube_lyrics,
+            "info": youtube_info,
+        },
+        "lrclib": {
+            "record": lrclib_rec,
+        },
     }
 
     lines.append("\n---")
@@ -219,7 +241,6 @@ def build_comment_body(
     lines.append(JSON_END)
 
     lines.append("\n※ このコメントは GitHub Actions の自動処理で追加されています。")
-
     return "\n".join(lines)
 
 
@@ -255,21 +276,56 @@ def main() -> None:
 
     print(f"action={action}, issue_number={issue_number}")
 
-    if action not in {"opened", "edited"}:
-        print("opened/edited 以外のアクションなのでスキップします。")
+    # opened/edited/reopened/labeled を処理
+    if action not in {"opened", "edited", "reopened", "labeled"}:
+        print("対象外アクションなのでスキップします。")
         return
 
     artist, title, video_id = parse_issue_body(issue_body)
     print(f"parsed: artist={artist}, title={title}, video_id={video_id}")
 
-    # 歌詞検索
-    rec = search_lyrics_by_artist_title(artist, title)
-    if rec:
-        print("[lyrics] record found:", rec.get("id"), rec.get("trackName"), rec.get("artistName"))
-    else:
-        print("[lyrics] no record found")
+    chosen_source = "none"
+    youtube_lyrics: Optional[str] = None
+    youtube_info: Optional[Dict[str, Any]] = None
+    lrclib_rec: Optional[Dict[str, Any]] = None
 
-    comment_body = build_comment_body(artist, title, video_id, rec)
+    # 1) YouTube（動画IDがある時だけ）
+    if video_id:
+        try:
+            y_lyrics, y_vid, y_info = lyrics_core.register_lyrics_from_request(
+                artist or "",
+                title or "",
+                video_id,
+            )
+            if _looks_like_lyrics(y_lyrics):
+                chosen_source = "youtube"
+                youtube_lyrics = y_lyrics
+                youtube_info = y_info
+                print("[youtube] lyrics ok")
+            else:
+                print("[youtube] lyrics empty/too short -> fallback to LRCLIB")
+        except Exception as e:
+            print(f"[youtube] error: {e} -> fallback to LRCLIB")
+
+    # 2) LRCLIB（YouTube が成功しなかった時）
+    if chosen_source != "youtube":
+        lrclib_rec = search_lrclib_by_artist_title(artist, title)
+        if lrclib_rec:
+            chosen_source = "lrclib"
+            print("[lrclib] record found:", lrclib_rec.get("id"), lrclib_rec.get("trackName"), lrclib_rec.get("artistName"))
+        else:
+            chosen_source = "none"
+            print("[lrclib] no record found")
+
+    comment_body = build_comment_body(
+        artist=artist,
+        title=title,
+        video_id=video_id,
+        chosen_source=chosen_source,
+        youtube_lyrics=youtube_lyrics,
+        youtube_info=youtube_info,
+        lrclib_rec=lrclib_rec,
+    )
     comment_to_issue(repo, issue_number, comment_body)
     print("comment posted.")
 
