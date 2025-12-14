@@ -9,7 +9,10 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
+      # GitHub のトークン
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # マルチラインの Netscape cookie を入れたシークレット
       YOUTUBE_COOKIES: ${{ secrets.YOUTUBE_COOKIES }}
 
     steps:
@@ -32,8 +35,9 @@ jobs:
 
       - name: Handle issue
         env:
-          # ★ 修正：lyrics_core.py が見る env 名（両対応も入れるが、ここは正しい名前に）
+          # ★ lyrics_core.py 側が見る環境変数名（両対応）
           YT_COOKIES_FILE: youtube_cookies.txt
+          YOUTUBE_COOKIES_FILE: youtube_cookies.txt
 
           GITHUB_TOKEN: ${{ env.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
