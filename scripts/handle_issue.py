@@ -1,17 +1,6 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
-"""
-Issue 本文からアーティスト/曲名/動画IDを取り出し、
-外部歌詞APIから plainLyrics / syncedLyrics を取得して
-Issue に結果コメントを追加するだけのスクリプト。
-
-- リポジトリ作成や README 作成はやらない
-- 歌詞サービス名はコメントに書かない
-- ローカルPC用スクリプトが機械的に拾えるように
-  JSON ペイロードもコメントに埋め込む
-"""
-
 import json
 import os
 import re
