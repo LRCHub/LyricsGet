@@ -15,7 +15,8 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT_DIR))  # ルート直下のモジュールを import できるように
 
 import lyrics_core   # YouTube 自動字幕
-import pl           # PetitLyrics 用
+import pl            # PetitLyrics
+import uta           # UtaTen
 
 
 # ---------- GitHub イベント読み込み ----------
@@ -155,12 +156,14 @@ def build_comment_body(
     artist: Optional[str],
     title: Optional[str],
     video_id: Optional[str],
-    chosen_source: str,  # "youtube" | "lrclib" | "petitlyrics" | "none"
+    chosen_source: str,  # "youtube" | "lrclib" | "petitlyrics" | "utaten" | "none"
     youtube_lyrics: Optional[str],
     youtube_info: Optional[Dict[str, Any]],
     lrclib_rec: Optional[Dict[str, Any]],
     petit_lyrics: Optional[str],
     petit_meta: Optional[Dict[str, Any]],
+    utaten_lyrics: Optional[str],
+    utaten_meta: Optional[Dict[str, Any]],
 ) -> str:
     lines: list[str] = []
 
@@ -172,10 +175,10 @@ def build_comment_body(
     lines.append(f"- 楽曲名: **{title}**" if title else "- 楽曲名: (未入力)")
     lines.append(f"- 動画 ID: `{video_id}`" if video_id else "- 動画 ID: (未指定)")
 
-    lines.append("\n### 検索結果")
+    lines.append("\n### 歌詞登録結果")
 
     if chosen_source == "youtube" and youtube_lyrics:
-        lines.append("- ステータス: Auto（YouTube 自動字幕）")
+        lines.append("- ステータス: 自動登録（YouTube 自動字幕）")
         lines.append("- 取得元: YouTube（自動字幕）")
         if youtube_info and youtube_info.get("url"):
             lines.append(f"- 参照: {youtube_info['url']}")
@@ -189,14 +192,14 @@ def build_comment_body(
         synced = (lrclib_rec.get("syncedLyrics") or "").strip()
 
         if synced:
-            status = "Auto（同期あり）"
+            status = "自動登録（同期あり）"
         elif plain:
-            status = "Auto（同期なし）"
+            status = "自動登録（同期なし）"
         else:
             status = "歌詞の登録なし"
 
         lines.append(f"- ステータス: {status}")
-        lines.append("- 取得元: LRCLIB")
+        lines.append("- 取得元: 外部歌詞データベース")
 
         tn = (lrclib_rec.get("trackName") or lrclib_rec.get("name") or "").strip()
         an = (lrclib_rec.get("artistName") or "").strip()
@@ -224,8 +227,8 @@ def build_comment_body(
             lines.append("- 歌詞が空でした。")
 
     elif chosen_source == "petitlyrics" and petit_lyrics:
-        lines.append("- ステータス: Auto（同期なし）")
-        lines.append("- 取得元: プチリリ")
+        lines.append("- ステータス: 自動登録（テキストのみ）")
+        lines.append("- 取得元: 歌詞サイト（その1）")
         if petit_meta:
             detail = []
             if petit_meta.get("title"):
@@ -242,9 +245,28 @@ def build_comment_body(
         lines.append(petit_lyrics.strip())
         lines.append("```")
 
+    elif chosen_source == "utaten" and utaten_lyrics:
+        lines.append("- ステータス: 自動登録（テキストのみ）")
+        lines.append("- 取得元: 歌詞サイト（その2）")
+        if utaten_meta:
+            detail = []
+            if utaten_meta.get("title"):
+                detail.append(f"title='{utaten_meta['title']}'")
+            if utaten_meta.get("artist"):
+                detail.append(f"artist='{utaten_meta['artist']}'")
+            if utaten_meta.get("url"):
+                detail.append(f"url={utaten_meta['url']}")
+            if detail:
+                lines.append(f"- 取得詳細: {', '.join(detail)}")
+
+        lines.append("\n#### 歌詞（テキスト）")
+        lines.append("```text")
+        lines.append(utaten_lyrics.strip())
+        lines.append("```")
+
     else:
         lines.append("- ステータス: 歌詞の取得に失敗しました")
-        lines.append("- 取得元: YouTube → LRCLIB → プチリリ（いずれも失敗）")
+        lines.append("- 取得元: YouTube → 外部DB → 歌詞サイト（複数）いずれも取得不可")
 
     # 機械用ペイロード
     payload: Dict[str, Any] = {
@@ -263,6 +285,10 @@ def build_comment_body(
             "lyrics": petit_lyrics,
             "meta": petit_meta,
         },
+        "utaten": {
+            "lyrics": utaten_lyrics,
+            "meta": utaten_meta,
+        },
     }
 
     lines.append("\n---")
@@ -273,7 +299,7 @@ def build_comment_body(
     lines.append("```")
     lines.append(JSON_END)
 
-    lines.append("\n※ このコメントは自動的に処理されています。間違った情報を返す場合があります。アーティストと曲名は、テンプレートに沿い、完全一致でお願いいたします")
+    lines.append("\n※ このコメントは GitHub Actions の自動処理で追加されています。")
     return "\n".join(lines)
 
 
@@ -322,6 +348,8 @@ def main() -> None:
     lrclib_rec: Optional[Dict[str, Any]] = None
     petit_lyrics: Optional[str] = None
     petit_meta: Optional[Dict[str, Any]] = None
+    utaten_lyrics: Optional[str] = None
+    utaten_meta: Optional[Dict[str, Any]] = None
 
     # 1) YouTube（動画IDがある場合のみ）
     if video_id:
@@ -366,11 +394,30 @@ def main() -> None:
                     chosen_source = "petitlyrics"
                     print("[petitlyrics] lyrics ok:", petit_meta)
                 else:
-                    print("[petitlyrics] lyrics empty/too short")
+                    print("[petitlyrics] lyrics empty/too short -> try UtaTen")
             except Exception as e:
-                print(f"[petitlyrics] error: {e}")
+                print(f"[petitlyrics] error: {e} -> try UtaTen")
         else:
             print("[petitlyrics] skipped (artist/title が空)")
+
+    # 4) UtaTen（YouTube & LRCLIB & プチリリ すべてダメなとき）
+    if chosen_source not in {"youtube", "lrclib", "petitlyrics"}:
+        if artist or title:
+            try:
+                utaten_lyrics, utaten_meta = uta.fetch_utaten(
+                    title or "",
+                    artist or "",
+                    sleep_sec=1.0,
+                )
+                if _looks_like_lyrics(utaten_lyrics):
+                    chosen_source = "utaten"
+                    print("[utaten] lyrics ok:", utaten_meta)
+                else:
+                    print("[utaten] lyrics empty/too short")
+            except Exception as e:
+                print(f"[utaten] error: {e}")
+        else:
+            print("[utaten] skipped (artist/title が空)")
 
     comment_body = build_comment_body(
         artist=artist,
@@ -382,6 +429,8 @@ def main() -> None:
         lrclib_rec=lrclib_rec,
         petit_lyrics=petit_lyrics,
         petit_meta=petit_meta,
+        utaten_lyrics=utaten_lyrics,
+        utaten_meta=utaten_meta,
     )
     comment_to_issue(repo, issue_number, comment_body)
     print("comment posted.")
