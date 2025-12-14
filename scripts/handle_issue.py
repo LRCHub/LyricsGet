@@ -12,9 +12,10 @@ import requests
 from github import Github, Auth
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT_DIR))  # ルートの lyrics_core.py を import できるようにする
+sys.path.insert(0, str(ROOT_DIR))  # ルート直下のモジュールを import できるように
 
-import lyrics_core  # noqa: E402
+import lyrics_core   # YouTube 自動字幕
+import pl           # PetitLyrics 用
 
 
 # ---------- GitHub イベント読み込み ----------
@@ -124,6 +125,14 @@ def search_lrclib_by_artist_title(
     return max(data, key=score)
 
 
+def _lrclib_has_lyrics(rec: Optional[Dict[str, Any]]) -> bool:
+    if not rec:
+        return False
+    plain = (rec.get("plainLyrics") or "").strip()
+    synced = (rec.get("syncedLyrics") or "").strip()
+    return bool(plain or synced)
+
+
 # ---------- コメント生成 ----------
 
 JSON_START = "<!-- LYRICS_API_JSON_START -->"
@@ -134,7 +143,6 @@ def _looks_like_lyrics(text: str) -> bool:
     t = (text or "").strip()
     if not t:
         return False
-    # 2行以上、かつ少しは長いものだけを「成功」とみなす（短すぎる誤爆を回避）
     lines = [x.strip() for x in t.splitlines() if x.strip()]
     if len(lines) < 2:
         return False
@@ -147,10 +155,12 @@ def build_comment_body(
     artist: Optional[str],
     title: Optional[str],
     video_id: Optional[str],
-    chosen_source: str,  # "youtube" | "lrclib" | "none"
+    chosen_source: str,  # "youtube" | "lrclib" | "petitlyrics" | "none"
     youtube_lyrics: Optional[str],
     youtube_info: Optional[Dict[str, Any]],
     lrclib_rec: Optional[Dict[str, Any]],
+    petit_lyrics: Optional[str],
+    petit_meta: Optional[Dict[str, Any]],
 ) -> str:
     lines: list[str] = []
 
@@ -213,9 +223,28 @@ def build_comment_body(
         if (not synced) and (not plain):
             lines.append("- 歌詞が空でした。")
 
+    elif chosen_source == "petitlyrics" and petit_lyrics:
+        lines.append("- ステータス: Auto（同期なし）")
+        lines.append("- 取得元: プチリリ")
+        if petit_meta:
+            detail = []
+            if petit_meta.get("title"):
+                detail.append(f"title='{petit_meta['title']}'")
+            if petit_meta.get("artist"):
+                detail.append(f"artist='{petit_meta['artist']}'")
+            if petit_meta.get("song_url"):
+                detail.append(f"url={petit_meta['song_url']}")
+            if detail:
+                lines.append(f"- 取得詳細: {', '.join(detail)}")
+
+        lines.append("\n#### 歌詞（テキスト）")
+        lines.append("```text")
+        lines.append(petit_lyrics.strip())
+        lines.append("```")
+
     else:
         lines.append("- ステータス: 歌詞の取得に失敗しました")
-        lines.append("- 取得元: YouTube → LRCLIB（どちらも失敗）")
+        lines.append("- 取得元: YouTube → LRCLIB → プチリリ（いずれも失敗）")
 
     # 機械用ペイロード
     payload: Dict[str, Any] = {
@@ -229,6 +258,10 @@ def build_comment_body(
         },
         "lrclib": {
             "record": lrclib_rec,
+        },
+        "petitlyrics": {
+            "lyrics": petit_lyrics,
+            "meta": petit_meta,
         },
     }
 
@@ -276,7 +309,6 @@ def main() -> None:
 
     print(f"action={action}, issue_number={issue_number}")
 
-    # opened/edited/reopened/labeled を処理
     if action not in {"opened", "edited", "reopened", "labeled"}:
         print("対象外アクションなのでスキップします。")
         return
@@ -288,8 +320,10 @@ def main() -> None:
     youtube_lyrics: Optional[str] = None
     youtube_info: Optional[Dict[str, Any]] = None
     lrclib_rec: Optional[Dict[str, Any]] = None
+    petit_lyrics: Optional[str] = None
+    petit_meta: Optional[Dict[str, Any]] = None
 
-    # 1) YouTube（動画IDがある時だけ）
+    # 1) YouTube（動画IDがある場合のみ）
     if video_id:
         try:
             y_lyrics, y_vid, y_info = lyrics_core.register_lyrics_from_request(
@@ -310,12 +344,33 @@ def main() -> None:
     # 2) LRCLIB（YouTube が成功しなかった時）
     if chosen_source != "youtube":
         lrclib_rec = search_lrclib_by_artist_title(artist, title)
-        if lrclib_rec:
+        if _lrclib_has_lyrics(lrclib_rec):
             chosen_source = "lrclib"
-            print("[lrclib] record found:", lrclib_rec.get("id"), lrclib_rec.get("trackName"), lrclib_rec.get("artistName"))
+            print("[lrclib] record with lyrics found:", lrclib_rec.get("id"), lrclib_rec.get("trackName"), lrclib_rec.get("artistName"))
         else:
-            chosen_source = "none"
-            print("[lrclib] no record found")
+            if lrclib_rec:
+                print("[lrclib] record found but lyrics empty")
+            else:
+                print("[lrclib] no record found")
+
+    # 3) PetitLyrics（YouTube & LRCLIB どちらもダメなとき）
+    if chosen_source not in {"youtube", "lrclib"}:
+        if artist or title:
+            try:
+                petit_lyrics, petit_meta = pl.fetch_petitlyrics(
+                    title or "",
+                    artist or "",
+                    sleep_sec=1.0,
+                )
+                if _looks_like_lyrics(petit_lyrics):
+                    chosen_source = "petitlyrics"
+                    print("[petitlyrics] lyrics ok:", petit_meta)
+                else:
+                    print("[petitlyrics] lyrics empty/too short")
+            except Exception as e:
+                print(f"[petitlyrics] error: {e}")
+        else:
+            print("[petitlyrics] skipped (artist/title が空)")
 
     comment_body = build_comment_body(
         artist=artist,
@@ -325,6 +380,8 @@ def main() -> None:
         youtube_lyrics=youtube_lyrics,
         youtube_info=youtube_info,
         lrclib_rec=lrclib_rec,
+        petit_lyrics=petit_lyrics,
+        petit_meta=petit_meta,
     )
     comment_to_issue(repo, issue_number, comment_body)
     print("comment posted.")
