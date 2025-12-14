@@ -167,7 +167,7 @@ def build_comment_body(
 ) -> str:
     lines: list[str] = []
 
-    lines.append("自動歌詞登録の結果をお知らせします 🤖\n")
+    lines.append("自動歌詞検索の結果をお知らせします 🤖\n")
 
     # 解析結果
     lines.append("### 解析結果")
@@ -175,7 +175,7 @@ def build_comment_body(
     lines.append(f"- 楽曲名: **{title}**" if title else "- 楽曲名: (未入力)")
     lines.append(f"- 動画 ID: `{video_id}`" if video_id else "- 動画 ID: (未指定)")
 
-    lines.append("\n### 歌詞登録結果")
+    lines.append("\n### 歌詞検索結果")
 
     if chosen_source == "youtube" and youtube_lyrics:
         lines.append("- ステータス: 自動登録（YouTube 自動字幕）")
