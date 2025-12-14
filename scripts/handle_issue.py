@@ -172,7 +172,7 @@ def build_comment_body(
     lines.append(f"- 楽曲名: **{title}**" if title else "- 楽曲名: (未入力)")
     lines.append(f"- 動画 ID: `{video_id}`" if video_id else "- 動画 ID: (未指定)")
 
-    lines.append("\n### 歌詞登録結果")
+    lines.append("\n### 検索結果")
 
     if chosen_source == "youtube" and youtube_lyrics:
         lines.append("- ステータス: Auto（YouTube 自動字幕）")
